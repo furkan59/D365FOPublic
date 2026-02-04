@@ -1,0 +1,731 @@
+class DRMSecurityReportExcelExport extends RunBaseBatch
+{
+    DialogField     dlgRolePrefix;
+    DialogField     dlgIncludeAll;
+    
+    str             rolePrefix;
+    NoYesId         includeAllRoles;
+    
+    List            roleSummaryData;
+    List            rolePrivilegeData;
+    List            roleDutyData;
+    List            privilegeSummaryData;
+    List            privilegeMenuItemData;
+    List            privilegeTableData;
+    List            privilegeDataEntityData;
+    
+    // SecurityRepository referansi
+    System.Object   securityRepository;
+    System.Object   privilegeRepository;
+    
+    #define.CurrentVersion(1)
+    #localmacro.CurrentList
+        rolePrefix,
+        includeAllRoles
+    #endmacro
+
+    public ClassDescription caption()
+    {
+        return "Security Configuration Export to Excel";
+    }
+
+    public boolean canGoBatch()
+    {
+        return true;
+    }
+
+    public boolean canRunInNewSession()
+    {
+        return false;
+    }
+
+    public Object dialog()
+    {
+        DialogRunbase dialog = super();
+        
+        dialog.addGroup("Filter Options");
+        
+        dlgRolePrefix = dialog.addFieldValue(
+            extendedTypeStr(Name),
+            rolePrefix,
+            "Role Prefix Filter",
+            "Enter role prefix to filter (e.g., 'DRM'). Leave empty for all.");
+        
+        dlgIncludeAll = dialog.addFieldValue(
+            extendedTypeStr(NoYesId),
+            includeAllRoles,
+            "Include All Roles",
+            "Yes = All roles, No = Only filtered/custom roles");
+        
+        return dialog;
+    }
+
+    public boolean getFromDialog()
+    {
+        rolePrefix = dlgRolePrefix.value();
+        includeAllRoles = dlgIncludeAll.value();
+        return super();
+    }
+
+    public container pack()
+    {
+        return [#CurrentVersion, #CurrentList];
+    }
+
+    public boolean unpack(container _packedClass)
+    {
+        int version = RunBase::getVersion(_packedClass);
+        
+        switch (version)
+        {
+            case #CurrentVersion:
+                [version, #CurrentList] = _packedClass;
+                break;
+            default:
+                return false;
+        }
+        
+        return true;
+    }
+
+    public void run()
+    {
+        try
+        {
+            setPrefix("Security Report Export");
+            
+            this.initializeVariables();
+            
+            info("Step 1/5: Initializing Security Repository...");
+            this.initSecurityRepository();
+            
+            info("Step 2/5: Collecting role data...");
+            this.collectRoleData();
+            
+            info("Step 3/5: Collecting privilege data...");
+            this.collectPrivilegeData();
+            
+            info("Step 4/5: Collecting privilege permissions (MenuItems, Tables, DataEntities)...");
+            this.collectPrivilegePermissions();
+            
+            info("Step 5/5: Generating Excel file...");
+            this.generateExcelFile();
+            
+            info("Report generation completed successfully!");
+        }
+        catch (Exception::CLRError)
+        {
+            System.Exception ex = CLRInterop::getLastException();
+            if (ex != null)
+            {
+                error(strFmt("CLR Error: %1", ex.ToString()));
+            }
+        }
+        catch (Exception::Error)
+        {
+            error("An error occurred during report generation.");
+        }
+    }
+
+    private void initializeVariables()
+    {
+        roleSummaryData          = new List(Types::Container);
+        rolePrivilegeData        = new List(Types::Container);
+        roleDutyData             = new List(Types::Container);
+        privilegeSummaryData     = new List(Types::Container);
+        privilegeMenuItemData    = new List(Types::Container);
+        privilegeTableData       = new List(Types::Container);
+        privilegeDataEntityData  = new List(Types::Container);
+    }
+
+    private void initSecurityRepository()
+    {
+        securityRepository = SysSecurity::GetSecurityRepository();
+        
+        if (securityRepository == null)
+        {
+            throw error("SecurityRepository alinamadi!");
+        }
+        
+        // Privileges repository al
+        System.Type repoType = securityRepository.GetType();
+        System.Reflection.PropertyInfo privProp = repoType.GetProperty("Privileges");
+        privilegeRepository = privProp.GetValue(securityRepository);
+        
+        if (privilegeRepository == null)
+        {
+            throw error("PrivilegeRepository alinamadi!");
+        }
+        
+        info("Security Repository basariyla alindi.");
+    }
+
+    private void collectRoleData()
+    {
+        SecurityRole                        secRole;
+        SecurityPrivilege                   secPrivilege;
+        SecurityDuty                        secDuty;
+        SecurityRolePrivilegeExplodedGraph  rolePrivGraph;
+        SecurityRoleDutyExplodedGraph       roleDutyGraph;
+        SecurityRoleExplodedGraph           roleGraph;
+        int                                 rowNum = 0;
+        
+        while select secRole
+            order by secRole.Name
+        {
+            if (!includeAllRoles && rolePrefix && !strStartsWith(secRole.AotName, rolePrefix))
+            {
+                continue;
+            }
+            
+            rowNum++;
+            
+            int privilegeCount = 0;
+            select count(RecId) from rolePrivGraph
+                where rolePrivGraph.SecurityRole == secRole.RecId;
+            privilegeCount = any2Int(rolePrivGraph.RecId);
+            
+            int dutyCount = 0;
+            select count(RecId) from roleDutyGraph
+                where roleDutyGraph.SecurityRole == secRole.RecId;
+            dutyCount = any2Int(roleDutyGraph.RecId);
+            
+            int subRoleCount = 0;
+            select count(RecId) from roleGraph
+                where roleGraph.SecurityRole == secRole.RecId
+                   && roleGraph.SecuritySubRole != secRole.RecId;
+            subRoleCount = any2Int(roleGraph.RecId);
+            
+            roleSummaryData.addEnd([
+                rowNum,
+                secRole.Name,
+                secRole.AotName,
+                secRole.Description,
+                privilegeCount,
+                dutyCount,
+                subRoleCount
+            ]);
+            
+            while select rolePrivGraph
+                where rolePrivGraph.SecurityRole == secRole.RecId
+                join secPrivilege
+                    where secPrivilege.RecId == rolePrivGraph.SecurityPrivilege
+            {
+                rolePrivilegeData.addEnd([
+                    secRole.Name,
+                    secRole.AotName,
+                    secPrivilege.Name,
+                    secPrivilege.Identifier
+                ]);
+            }
+            
+            while select roleDutyGraph
+                where roleDutyGraph.SecurityRole == secRole.RecId
+                join secDuty
+                    where secDuty.RecId == roleDutyGraph.SecurityDuty
+            {
+                roleDutyData.addEnd([
+                    secRole.Name,
+                    secRole.AotName,
+                    secDuty.Name,
+                    secDuty.Identifier
+                ]);
+            }
+        }
+        
+        info(strFmt("Processed %1 roles", rowNum));
+    }
+
+    private void collectPrivilegeData()
+    {
+        SecurityPrivilege secPrivilege;
+        int rowNum = 0;
+        
+        while select secPrivilege
+            order by secPrivilege.Name
+        {
+            rowNum++;
+            
+            privilegeSummaryData.addEnd([
+                rowNum,
+                secPrivilege.Name,
+                secPrivilege.Identifier,
+                secPrivilege.Description
+            ]);
+        }
+        
+        info(strFmt("Collected %1 privileges", rowNum));
+    }
+
+    /// <summary>
+    /// SecurityRepository kullanarak privilege permissions topla
+    /// </summary>
+    private void collectPrivilegePermissions()
+    {
+        System.Type privRepoType = privilegeRepository.GetType();
+        
+        System.Reflection.MethodInfo listMethod = privRepoType.GetMethod("ListObjects");
+        System.Object privList = listMethod.Invoke(privilegeRepository, null);
+        
+        System.Type[] paramTypes = new System.Type[1]();
+        paramTypes.SetValue(System.Type::GetType("System.String"), 0);
+        System.Reflection.MethodInfo readMethod = privRepoType.GetMethod("Read", paramTypes);
+        
+        System.Collections.IEnumerable enumerable = privList as System.Collections.IEnumerable;
+        System.Collections.IEnumerator enumerator = enumerable.GetEnumerator();
+        
+        int privCnt = 0;
+        int menuItemCnt = 0;
+        int tableCnt = 0;
+        int dataEntityCnt = 0;
+        
+        while (enumerator.MoveNext())
+        {
+            str privName = enumerator.Current;
+            privCnt++;
+            
+            System.Object[] paramValues = new System.Object[1]();
+            paramValues.SetValue(privName, 0);
+            System.Object privilege = readMethod.Invoke(privilegeRepository, paramValues);
+            
+            if (privilege != null)
+            {
+                System.Type privType = privilege.GetType();
+                
+                // Menu Items (Display, Action, Output)
+                menuItemCnt += this.collectGrants(privilege, privType, privName, "DisplayMenuItemGrants", "Display", privilegeMenuItemData);
+                menuItemCnt += this.collectGrants(privilege, privType, privName, "ActionMenuItemGrants", "Action", privilegeMenuItemData);
+                menuItemCnt += this.collectGrants(privilege, privType, privName, "OutputMenuItemGrants", "Output", privilegeMenuItemData);
+                menuItemCnt += this.collectGrants(privilege, privType, privName, "ServiceOperationGrants", "ServiceOp", privilegeMenuItemData);
+                
+                // Tables (DataModelGrants)
+                tableCnt += this.collectGrants(privilege, privType, privName, "DataModelGrants", "Table", privilegeTableData);
+                
+                // Data Entities
+                dataEntityCnt += this.collectDataEntityGrants(privilege, privType, privName);
+            }
+        }
+        
+        info(strFmt("Processed %1 privileges: %2 menu items, %3 tables, %4 data entities",
+            privCnt, menuItemCnt, tableCnt, dataEntityCnt));
+    }
+
+    private int collectGrants(System.Object _privilege, System.Type _privType, str _privName,
+                              str _propertyName, str _grantType, List _targetList)
+    {
+        int cnt = 0;
+        
+        try
+        {
+            System.Reflection.PropertyInfo grantsProp = _privType.GetProperty(_propertyName);
+            
+            if (grantsProp != null)
+            {
+                System.Object grants = grantsProp.GetValue(_privilege);
+                
+                if (grants != null)
+                {
+                    System.Collections.IEnumerable grantEnum = grants as System.Collections.IEnumerable;
+                    
+                    if (grantEnum != null)
+                    {
+                        System.Collections.IEnumerator grantEnumerator = grantEnum.GetEnumerator();
+                        
+                        while (grantEnumerator.MoveNext())
+                        {
+                            System.Object grantItem = grantEnumerator.Current;
+                            cnt++;
+                            
+                            System.Type grantType = grantItem.GetType();
+                            
+                            // Name
+                            str itemName = this.getPropertyValue(grantItem, grantType, "Name");
+                            
+                            // Grant (Access Level)
+                            str grantStr = this.getPropertyValue(grantItem, grantType, "Grant");
+                            
+                            // CRUD parse
+                            str accessCreate = strScan(grantStr, "C:[Allow]", 1, strLen(grantStr)) > 0 ? "Allow" : "";
+                            str accessRead = strScan(grantStr, "R:[Allow]", 1, strLen(grantStr)) > 0 ? "Allow" : "";
+                            str accessUpdate = strScan(grantStr, "U:[Allow]", 1, strLen(grantStr)) > 0 ? "Allow" : "";
+                            str accessDelete = strScan(grantStr, "D:[Allow]", 1, strLen(grantStr)) > 0 ? "Allow" : "";
+                            
+                            _targetList.addEnd([
+                                _privName,
+                                itemName,
+                                _grantType,
+                                accessCreate,
+                                accessRead,
+                                accessUpdate,
+                                accessDelete
+                            ]);
+                        }
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // Sessizce devam
+        }
+        
+        return cnt;
+    }
+
+    private int collectDataEntityGrants(System.Object _privilege, System.Type _privType, str _privName)
+    {
+        int cnt = 0;
+        
+        try
+        {
+            System.Reflection.PropertyInfo grantsProp = _privType.GetProperty("DataEntityGrants");
+            
+            if (grantsProp != null)
+            {
+                System.Object grants = grantsProp.GetValue(_privilege);
+                
+                if (grants != null)
+                {
+                    System.Collections.IEnumerable grantEnum = grants as System.Collections.IEnumerable;
+                    
+                    if (grantEnum != null)
+                    {
+                        System.Collections.IEnumerator grantEnumerator = grantEnum.GetEnumerator();
+                        
+                        while (grantEnumerator.MoveNext())
+                        {
+                            System.Object grantItem = grantEnumerator.Current;
+                            cnt++;
+                            
+                            System.Type grantType = grantItem.GetType();
+                            
+                            // Name
+                            str itemName = this.getPropertyValue(grantItem, grantType, "Name");
+                            
+                            // IntegrationMode
+                            str integrationMode = this.getPropertyValue(grantItem, grantType, "IntegrationMode");
+                            
+                            // Grant
+                            str grantStr = this.getPropertyValue(grantItem, grantType, "Grant");
+                            
+                            // CRUD parse
+                            str accessCreate = strScan(grantStr, "C:[Allow]", 1, strLen(grantStr)) > 0 ? "Allow" : "";
+                            str accessRead = strScan(grantStr, "R:[Allow]", 1, strLen(grantStr)) > 0 ? "Allow" : "";
+                            str accessUpdate = strScan(grantStr, "U:[Allow]", 1, strLen(grantStr)) > 0 ? "Allow" : "";
+                            str accessDelete = strScan(grantStr, "D:[Allow]", 1, strLen(grantStr)) > 0 ? "Allow" : "";
+                            
+                            privilegeDataEntityData.addEnd([
+                                _privName,
+                                itemName,
+                                integrationMode,
+                                accessCreate,
+                                accessRead,
+                                accessUpdate,
+                                accessDelete
+                            ]);
+                        }
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // Sessizce devam
+        }
+        
+        return cnt;
+    }
+
+    private str getPropertyValue(System.Object _obj, System.Type _type, str _propName)
+    {
+        str result = "";
+        
+        try
+        {
+            System.Reflection.PropertyInfo prop = _type.GetProperty(_propName);
+            if (prop != null)
+            {
+                System.Object val = prop.GetValue(_obj);
+                if (val != null)
+                {
+                    result = val.ToString();
+                }
+            }
+        }
+        catch
+        {
+            // Hata durumunda bos dondur
+        }
+        
+        return result;
+    }
+
+    private void generateExcelFile()
+    {
+        DocuFileSaveResult saveResult = DocuFileSave::promptForSaveLocation(
+            "@ApplicationPlatform:OfficeDefaultWorkbookFileName",
+            "xlsx",
+            null,
+            "Security Configuration Report");
+        
+        if (saveResult && saveResult.parmAction() != DocuFileSaveAction::Cancel)
+        {
+            saveResult.parmOpenParameters('web=1');
+            saveResult.parmOpenInNewWindow(false);
+            
+            System.IO.MemoryStream memoryStream = new System.IO.MemoryStream();
+            
+            using (OfficeOpenXml.ExcelPackage package = new OfficeOpenXml.ExcelPackage(memoryStream))
+            {
+                OfficeOpenXml.ExcelWorkbook workbook = package.get_Workbook();
+                OfficeOpenXml.ExcelWorksheets worksheets = workbook.get_Worksheets();
+                
+                this.createSheet_RollerOzet(worksheets);
+                this.createSheet_RolPrivilege(worksheets);
+                this.createSheet_RolDuty(worksheets);
+                this.createSheet_PrivilegeOzet(worksheets);
+                this.createSheet_PrivilegeMenuItems(worksheets);
+                this.createSheet_PrivilegeTables(worksheets);
+                this.createSheet_PrivilegeDataEntities(worksheets);
+                
+                package.Save();
+            }
+            
+            memoryStream.Seek(0, System.IO.SeekOrigin::Begin);
+            DocuFileSave::processSaveResult(memoryStream, saveResult);
+            
+            info("Excel file generated successfully.");
+        }
+        else
+        {
+            info("Export cancelled.");
+        }
+    }
+
+    private void createSheet_RollerOzet(OfficeOpenXml.ExcelWorksheets _worksheets)
+    {
+        OfficeOpenXml.ExcelWorksheet worksheet = _worksheets.Add("Roller Ozet");
+        OfficeOpenXml.ExcelRange cells = worksheet.get_Cells();
+        int currentRow = 1;
+        
+        cells.get_Item(currentRow, 1).set_Value("#");
+        cells.get_Item(currentRow, 2).set_Value("Rol Adi");
+        cells.get_Item(currentRow, 3).set_Value("AOT Name");
+        cells.get_Item(currentRow, 4).set_Value("Aciklama");
+        cells.get_Item(currentRow, 5).set_Value("Privilege Sayisi");
+        cells.get_Item(currentRow, 6).set_Value("Duty Sayisi");
+        cells.get_Item(currentRow, 7).set_Value("SubRole Sayisi");
+        
+        ListEnumerator le = roleSummaryData.getEnumerator();
+        while (le.moveNext())
+        {
+            currentRow++;
+            container c = le.current();
+            
+            cells.get_Item(currentRow, 1).set_Value(conPeek(c, 1));
+            cells.get_Item(currentRow, 2).set_Value(conPeek(c, 2));
+            cells.get_Item(currentRow, 3).set_Value(conPeek(c, 3));
+            cells.get_Item(currentRow, 4).set_Value(conPeek(c, 4));
+            cells.get_Item(currentRow, 5).set_Value(conPeek(c, 5));
+            cells.get_Item(currentRow, 6).set_Value(conPeek(c, 6));
+            cells.get_Item(currentRow, 7).set_Value(conPeek(c, 7));
+        }
+        
+        worksheet.get_Cells().AutoFitColumns();
+    }
+
+    private void createSheet_RolPrivilege(OfficeOpenXml.ExcelWorksheets _worksheets)
+    {
+        OfficeOpenXml.ExcelWorksheet worksheet = _worksheets.Add("Rol-Privilege");
+        OfficeOpenXml.ExcelRange cells = worksheet.get_Cells();
+        int currentRow = 1;
+        
+        cells.get_Item(currentRow, 1).set_Value("Rol Adi");
+        cells.get_Item(currentRow, 2).set_Value("Rol AOT Name");
+        cells.get_Item(currentRow, 3).set_Value("Privilege Adi");
+        cells.get_Item(currentRow, 4).set_Value("Privilege Identifier");
+        
+        ListEnumerator le = rolePrivilegeData.getEnumerator();
+        while (le.moveNext())
+        {
+            currentRow++;
+            container c = le.current();
+            
+            cells.get_Item(currentRow, 1).set_Value(conPeek(c, 1));
+            cells.get_Item(currentRow, 2).set_Value(conPeek(c, 2));
+            cells.get_Item(currentRow, 3).set_Value(conPeek(c, 3));
+            cells.get_Item(currentRow, 4).set_Value(conPeek(c, 4));
+        }
+        
+        worksheet.get_Cells().AutoFitColumns();
+    }
+
+    private void createSheet_RolDuty(OfficeOpenXml.ExcelWorksheets _worksheets)
+    {
+        OfficeOpenXml.ExcelWorksheet worksheet = _worksheets.Add("Rol-Duty");
+        OfficeOpenXml.ExcelRange cells = worksheet.get_Cells();
+        int currentRow = 1;
+        
+        cells.get_Item(currentRow, 1).set_Value("Rol Adi");
+        cells.get_Item(currentRow, 2).set_Value("Rol AOT Name");
+        cells.get_Item(currentRow, 3).set_Value("Duty Adi");
+        cells.get_Item(currentRow, 4).set_Value("Duty Identifier");
+        
+        ListEnumerator le = roleDutyData.getEnumerator();
+        while (le.moveNext())
+        {
+            currentRow++;
+            container c = le.current();
+            
+            cells.get_Item(currentRow, 1).set_Value(conPeek(c, 1));
+            cells.get_Item(currentRow, 2).set_Value(conPeek(c, 2));
+            cells.get_Item(currentRow, 3).set_Value(conPeek(c, 3));
+            cells.get_Item(currentRow, 4).set_Value(conPeek(c, 4));
+        }
+        
+        worksheet.get_Cells().AutoFitColumns();
+    }
+
+    private void createSheet_PrivilegeOzet(OfficeOpenXml.ExcelWorksheets _worksheets)
+    {
+        OfficeOpenXml.ExcelWorksheet worksheet = _worksheets.Add("Privilege Ozet");
+        OfficeOpenXml.ExcelRange cells = worksheet.get_Cells();
+        int currentRow = 1;
+        
+        cells.get_Item(currentRow, 1).set_Value("#");
+        cells.get_Item(currentRow, 2).set_Value("Privilege Adi");
+        cells.get_Item(currentRow, 3).set_Value("Identifier");
+        cells.get_Item(currentRow, 4).set_Value("Aciklama");
+        
+        ListEnumerator le = privilegeSummaryData.getEnumerator();
+        while (le.moveNext())
+        {
+            currentRow++;
+            container c = le.current();
+            
+            cells.get_Item(currentRow, 1).set_Value(conPeek(c, 1));
+            cells.get_Item(currentRow, 2).set_Value(conPeek(c, 2));
+            cells.get_Item(currentRow, 3).set_Value(conPeek(c, 3));
+            cells.get_Item(currentRow, 4).set_Value(conPeek(c, 4));
+        }
+        
+        worksheet.get_Cells().AutoFitColumns();
+    }
+
+    private void createSheet_PrivilegeMenuItems(OfficeOpenXml.ExcelWorksheets _worksheets)
+    {
+        OfficeOpenXml.ExcelWorksheet worksheet = _worksheets.Add("Privilege-MenuItems");
+        OfficeOpenXml.ExcelRange cells = worksheet.get_Cells();
+        int currentRow = 1;
+        
+        cells.get_Item(currentRow, 1).set_Value("Privilege Adi");
+        cells.get_Item(currentRow, 2).set_Value("Menu Item");
+        cells.get_Item(currentRow, 3).set_Value("Tur");
+        cells.get_Item(currentRow, 4).set_Value("Create");
+        cells.get_Item(currentRow, 5).set_Value("Read");
+        cells.get_Item(currentRow, 6).set_Value("Update");
+        cells.get_Item(currentRow, 7).set_Value("Delete");
+        
+        ListEnumerator le = privilegeMenuItemData.getEnumerator();
+        while (le.moveNext())
+        {
+            currentRow++;
+            container c = le.current();
+            
+            cells.get_Item(currentRow, 1).set_Value(conPeek(c, 1));
+            cells.get_Item(currentRow, 2).set_Value(conPeek(c, 2));
+            cells.get_Item(currentRow, 3).set_Value(conPeek(c, 3));
+            cells.get_Item(currentRow, 4).set_Value(conPeek(c, 4));
+            cells.get_Item(currentRow, 5).set_Value(conPeek(c, 5));
+            cells.get_Item(currentRow, 6).set_Value(conPeek(c, 6));
+            cells.get_Item(currentRow, 7).set_Value(conPeek(c, 7));
+        }
+        
+        worksheet.get_Cells().AutoFitColumns();
+    }
+
+    private void createSheet_PrivilegeTables(OfficeOpenXml.ExcelWorksheets _worksheets)
+    {
+        OfficeOpenXml.ExcelWorksheet worksheet = _worksheets.Add("Privilege-Tables");
+        OfficeOpenXml.ExcelRange cells = worksheet.get_Cells();
+        int currentRow = 1;
+        
+        cells.get_Item(currentRow, 1).set_Value("Privilege Adi");
+        cells.get_Item(currentRow, 2).set_Value("Table Name");
+        cells.get_Item(currentRow, 3).set_Value("Tur");
+        cells.get_Item(currentRow, 4).set_Value("Create");
+        cells.get_Item(currentRow, 5).set_Value("Read");
+        cells.get_Item(currentRow, 6).set_Value("Update");
+        cells.get_Item(currentRow, 7).set_Value("Delete");
+        
+        ListEnumerator le = privilegeTableData.getEnumerator();
+        while (le.moveNext())
+        {
+            currentRow++;
+            container c = le.current();
+            
+            cells.get_Item(currentRow, 1).set_Value(conPeek(c, 1));
+            cells.get_Item(currentRow, 2).set_Value(conPeek(c, 2));
+            cells.get_Item(currentRow, 3).set_Value(conPeek(c, 3));
+            cells.get_Item(currentRow, 4).set_Value(conPeek(c, 4));
+            cells.get_Item(currentRow, 5).set_Value(conPeek(c, 5));
+            cells.get_Item(currentRow, 6).set_Value(conPeek(c, 6));
+            cells.get_Item(currentRow, 7).set_Value(conPeek(c, 7));
+        }
+        
+        worksheet.get_Cells().AutoFitColumns();
+    }
+
+    private void createSheet_PrivilegeDataEntities(OfficeOpenXml.ExcelWorksheets _worksheets)
+    {
+        OfficeOpenXml.ExcelWorksheet worksheet = _worksheets.Add("Privilege-DataEntities");
+        OfficeOpenXml.ExcelRange cells = worksheet.get_Cells();
+        int currentRow = 1;
+        
+        cells.get_Item(currentRow, 1).set_Value("Privilege Adi");
+        cells.get_Item(currentRow, 2).set_Value("Data Entity Name");
+        cells.get_Item(currentRow, 3).set_Value("Integration Mode");
+        cells.get_Item(currentRow, 4).set_Value("Create");
+        cells.get_Item(currentRow, 5).set_Value("Read");
+        cells.get_Item(currentRow, 6).set_Value("Update");
+        cells.get_Item(currentRow, 7).set_Value("Delete");
+        
+        ListEnumerator le = privilegeDataEntityData.getEnumerator();
+        while (le.moveNext())
+        {
+            currentRow++;
+            container c = le.current();
+            
+            cells.get_Item(currentRow, 1).set_Value(conPeek(c, 1));
+            cells.get_Item(currentRow, 2).set_Value(conPeek(c, 2));
+            cells.get_Item(currentRow, 3).set_Value(conPeek(c, 3));
+            cells.get_Item(currentRow, 4).set_Value(conPeek(c, 4));
+            cells.get_Item(currentRow, 5).set_Value(conPeek(c, 5));
+            cells.get_Item(currentRow, 6).set_Value(conPeek(c, 6));
+            cells.get_Item(currentRow, 7).set_Value(conPeek(c, 7));
+        }
+        
+        worksheet.get_Cells().AutoFitColumns();
+    }
+
+    public static DRMSecurityReportExcelExport  construct()
+    {
+        return new DRMSecurityReportExcelExport ();
+    }
+
+    public static void main(Args _args)
+    {
+        DRMSecurityReportExcelExport  report = DRMSecurityReportExcelExport ::construct();
+        
+        if (report.prompt())
+        {
+            report.runOperation();
+        }
+    }
+
+    public static ClassDescription description()
+    {
+        return "Export Security Configuration to Excel";
+    }
+
+}
